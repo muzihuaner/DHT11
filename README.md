@@ -8,6 +8,7 @@
 - 心知天气 5 日天气预报（白天/夜间天气、高低温、风向风级、湿度、降雨量）
 - NTP 网络校准时间，精确显示
 - 网页仪表盘，每 5 秒自动刷新
+- 飞书机器人每 30 分钟推送温湿度/天气/IP 卡片
 - 深色渐变 UI，响应式布局适配手机/电脑
 
 ## 硬件接线
@@ -39,6 +40,7 @@ const char* ssid     = "YOUR_WIFI_SSID";   // WiFi 名称
 const char* password = "YOUR_WIFI_PASSWORD"; // WiFi 密码
 const char* apiKey   = "Sd8_LszRLgx94kS2m"; // 心知天气密钥
 const char* city     = "datong";             // 城市（拼音/ID）
+const char* feishuWebhook = "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx"; // 飞书机器人
 ```
 
 ## 获取心知天气 API Key
@@ -50,6 +52,28 @@ const char* city     = "datong";             // 城市（拼音/ID）
 ## NTP 时间
 
 使用阿里云 NTP 服务器 `ntp.aliyun.com`，自动同步北京时间 (UTC+8)，无需额外配置。
+
+## 飞书定时推送
+
+固件会通过飞书自定义机器人，**每 30 分钟**推送一张卡片到群聊（开机 8 秒后先推一次，之后每 30 分钟一次；推送失败则 5 分钟后重试）。
+
+卡片内容：
+
+| 区域 | 内容 |
+|----|----|
+| 温湿度 | 当前室内温度、湿度 |
+| 天气 | 今日白天/夜间天气、最高/最低气温、风向风级、降雨量 |
+| 设备 | 局域网 IP、运行时长、时间 |
+| 按钮 | 「打开仪表盘」直达 `http://设备IP` |
+
+配置方式：在 `DHT11_Weather.ino` 顶部填入机器人 Webhook 地址即可，无需签名密钥：
+
+```cpp
+const char* feishuWebhook = "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx";
+```
+
+> 飞书机器人后台请保持「签名校验」关闭；若开启，需要额外传入 `timestamp` + `sign` 字段。
+> 单次推送约占用 2~4 秒（HTTPS 握手），期间网页请求会短暂等待，属正常现象。
 
 ## 上传烧录
 

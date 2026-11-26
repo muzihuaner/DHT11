@@ -2,6 +2,7 @@
 #include <WebServer.h>
 #include <DHT.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <time.h>
 #include <WiFiUdp.h>
@@ -11,6 +12,9 @@ const char* password = "asdfghjkl...";    // 替换为你的 WiFi 密码
 
 const char* apiKey = "Sd8_LszRLgx94kS2m"; // 心知天气 API Key
 const char* city = "datong";              // 城市
+
+// 飞书自定义机器人 Webhook
+const char* feishuWebhook = "https://open.feishu.cn/open-apis/bot/v2/hook/602afa60-47fa-4f92-8023-1fc05b073318";
 
 const char* ntpServer = "ntp.aliyun.com";
 const long  gmtOffset_sec = 8 * 3600;
@@ -46,6 +50,11 @@ int    forecastCount = 0;
 
 unsigned long lastWeatherFetch = 0;
 const unsigned long weatherInterval = 600000;
+
+// 飞书推送：开机 8 秒后推一次，之后每 30 分钟一次；失败则 5 分钟后重试
+const unsigned long feishuInterval = 30UL * 60UL * 1000UL;
+const unsigned long feishuRetryInterval = 5UL * 60UL * 1000UL;
+unsigned long nextFeishuPush = 0;
 
 const char NTP_PACKET_BASE[48] = {
   0x1B, 0, 0, 0, 0, 0, 0, 0,
@@ -377,6 +386,111 @@ String getUptime() {
   return String(buf);
 }
 
+// 飞书卡片双列字段
+void feishuField(JsonArray fields, const String& label, const String& value) {
+  JsonObject f = fields.createNestedObject();
+  f["is_short"] = true;
+  f["text"]["tag"] = "lark_md";
+  f["text"]["content"] = "**" + label + "**\n" + value;
+}
+
+// 组装并发送飞书卡片，返回是否成功
+bool pushFeishu() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[飞书] WiFi 未连接，跳过本次推送");
+    return false;
+  }
+
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+  if (!isnan(t) && !isnan(h)) {
+    temperature = t;
+    humidity = h;
+  }
+
+  if (forecastCount == 0 || millis() - lastWeatherFetch > weatherInterval) {
+    fetchWeather();
+    lastWeatherFetch = millis();
+  }
+
+  updateTime();
+
+  String ip = WiFi.localIP().toString();
+
+  DynamicJsonDocument doc(3072);
+  doc["msg_type"] = "interactive";
+
+  JsonObject card = doc.createNestedObject("card");
+  card["config"]["wide_screen_mode"] = true;
+  card["header"]["template"] = "blue";
+  card["header"]["title"]["tag"] = "plain_text";
+  card["header"]["title"]["content"] = "🏠 室内环境 · 大同";
+
+  JsonArray elements = card.createNestedArray("elements");
+
+  JsonObject env = elements.createNestedObject();
+  env["tag"] = "div";
+  JsonArray envFields = env.createNestedArray("fields");
+  feishuField(envFields, "🌡 温度", String(temperature, 1) + " °C");
+  feishuField(envFields, "💧 湿度", String(humidity, 1) + " %");
+
+  elements.createNestedObject()["tag"] = "hr";
+
+  if (forecastCount > 0) {
+    JsonObject wx = elements.createNestedObject();
+    wx["tag"] = "div";
+    JsonArray wxFields = wx.createNestedArray("fields");
+    feishuField(wxFields, "☀️ 今日天气", forecastDayText[0] + " / " + forecastNightText[0]);
+    feishuField(wxFields, "🌡 气温", String(forecastHigh[0]) + "° / " + String(forecastLow[0]) + "°");
+    feishuField(wxFields, "🌬 风向", forecastWindDir[0] + " " + String(forecastWindScale[0]) + "级");
+    feishuField(wxFields, "💦 降雨", String(forecastRainfall[0], 1) + " mm");
+    elements.createNestedObject()["tag"] = "hr";
+  }
+
+  JsonObject dev = elements.createNestedObject();
+  dev["tag"] = "div";
+  dev["text"]["tag"] = "lark_md";
+  dev["text"]["content"] = "**📶 设备**\nIP `" + ip + "` · 运行 " + getUptime();
+
+  JsonObject action = elements.createNestedObject();
+  action["tag"] = "action";
+  JsonObject button = action.createNestedArray("actions").createNestedObject();
+  button["tag"] = "button";
+  button["text"]["tag"] = "plain_text";
+  button["text"]["content"] = "打开仪表盘";
+  button["type"] = "primary";
+  button["url"] = "http://" + ip;
+
+  JsonObject note = elements.createNestedObject();
+  note["tag"] = "note";
+  JsonObject noteText = note.createNestedArray("elements").createNestedObject();
+  noteText["tag"] = "plain_text";
+  noteText["content"] = ntpDate + " " + ntpTime + " · 每 30 分钟自动推送";
+
+  String payload;
+  serializeJson(doc, payload);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(10000);
+  if (!http.begin(client, feishuWebhook)) {
+    Serial.println("[飞书] 建立连接失败");
+    return false;
+  }
+  http.addHeader("Content-Type", "application/json; charset=utf-8");
+  int httpCode = http.POST(payload);
+  String response = http.getString();
+  http.end();
+
+  if (httpCode == 200 && response.indexOf("\"code\":0") >= 0) {
+    Serial.printf("[飞书] 推送成功 (%.1f°C / %.1f%%)\n", temperature, humidity);
+    return true;
+  }
+  Serial.printf("[飞书] 推送失败 HTTP %d: %s\n", httpCode, response.c_str());
+  return false;
+}
+
 void handleRoot() {
   server.send_P(200, "text/html", index_html);
 }
@@ -465,4 +579,15 @@ void setup() {
 void loop() {
   server.handleClient();
   handleNtpRequest();
+
+  // 飞书定时推送
+  if (nextFeishuPush == 0) {
+    if (millis() - bootMillis > 8000) {   // 开机 8 秒后首推
+      bool ok = pushFeishu();
+      nextFeishuPush = millis() + (ok ? feishuInterval : feishuRetryInterval);
+    }
+  } else if ((long)(millis() - nextFeishuPush) >= 0) {
+    bool ok = pushFeishu();
+    nextFeishuPush = millis() + (ok ? feishuInterval : feishuRetryInterval);
+  }
 }
